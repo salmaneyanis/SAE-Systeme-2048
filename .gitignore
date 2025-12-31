@@ -1,0 +1,70 @@
+# =====================
+# Fichiers binaires
+# =====================
+*.o
+*.out
+*.exe
+*.a
+*.so
+*.dll
+
+# =====================
+# Exécutables sans extension (Linux / WSL)
+# =====================
+main
+a.out
+
+# =====================
+# Dossiers de build
+# =====================
+build/
+bin/
+dist/
+
+# =====================
+# Fichiers temporaires
+# =====================
+*~
+*.swp
+*.swo
+*.tmp
+
+# =====================
+# Logs
+# =====================
+*.log
+
+# =====================
+# IDE / éditeurs
+# =====================
+.vscode/
+.idea/
+*.iml
+
+# =====================
+# OS
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# Debug / coverage
+# =====================
+*.gcda
+*.gcno
+*.gcov
+
+# =====================
+# Archives
+# =====================
+*.zip
+*.tar
+*.tar.gz
+
+# =====================
+# CMake (si utilisé)
+# =====================
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
