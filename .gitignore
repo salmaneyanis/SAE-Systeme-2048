@@ -61,10 +61,3 @@ Thumbs.db
 *.tar
 *.tar.gz
 
-# =====================
-# CMake (si utilisé)
-# =====================
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
