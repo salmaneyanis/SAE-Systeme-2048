@@ -75,11 +75,13 @@ run: all
 	@echo "OU utilisez: make run-game"
 
 run-game: all
-	@echo "Lancement automatique..."
-	@./bin/game2048 & \
-	 sleep 1; \
-	 ./bin/main; \
-	 wait
+	@echo "Lancement automatique avec pipe..."
+	@mkfifo /tmp/2048_main_pipe || true
+	@./bin/game2048 < /tmp/2048_main_pipe > /tmp/2048_main_pipe &
+	@sleep 1
+	@./bin/main < /tmp/2048_main_pipe > /tmp/2048_main_pipe
+	@rm -f /tmp/2048_main_pipe
+
 
 .PHONY: all clean distclean run run-game
 
