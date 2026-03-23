@@ -1,332 +1,380 @@
-/*
- * game_2048.c
- *
- * Processus principal du jeu 2048.
- *
- * Architecture :
- *   - Thread principal   : lit le pipe nommé, transmet les commandes à Move&Score
- *   - Thread Move&Score  : attend SIGUSR1, déplace les tuiles, réveille Goal
- *   - Thread Goal        : attend SIGUSR1, vérifie fin de partie, envoie au display
- *
- * Synchronisation inter-threads : SIGNAUX uniquement (pthread_kill + sigwait)
- * Communication inter-processus : pipe nommé (main->2048) et pipe anonyme (2048->display)
- */
 
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <semaphore.h>
 #include <errno.h>
-#include <string.h>
 #include <time.h>
 #include "common.h"
 #include "game_state.h"
 #include "game_logic.h"
 #include "ipc.h"
 
-/* Signaux de synchronisation inter-threads */
-#define SIG_MOVE SIGUSR1   /* principal -> Move&Score */
-#define SIG_GOAL SIGUSR2   /* Move&Score -> Goal      */
+typedef struct {
+    int           game_id;
+    bool          active;
+    GameState     state;
+    MoveDirection pending_dir;
+    int           display_pipe[2];
+    pid_t         display_pid;
+} GameEntry;
 
-/* Etat du jeu partage entre Move&Score et Goal. */
-static GameState shared_game_state;
-
-/* Direction du prochain mouvement, ecrite par le principal, lue par Move&Score. */
-static volatile MoveDirection pending_direction;
-
-/* Controle d'arret global. */
-static volatile sig_atomic_t game_running = 1;
-
-/* TIDs pour pouvoir envoyer des signaux aux threads depuis d'autres threads. */
+static volatile sig_atomic_t server_running = 1;
+static GameEntry       *games      = NULL;
+static int              nb_games   = 0;
+static pthread_mutex_t  games_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t move_tid;
 static pthread_t goal_tid;
+static volatile int current_game_id = -1;
+static SharedSlot *shm_slots   = NULL;
+static int         shm_n_slots = 1;
+static int         shm_fd      = -1;
 
-/* Pipe anonyme vers le processus d'affichage. */
-static int display_pipe[2];
-
-/* PID du processus d'affichage. */
-static pid_t display_pid = 0;
-
-/* ============================================================
- * UTILITAIRES
- * ============================================================ */
-
-static MoveDirection command_to_direction(CommandType cmd)
+static int shm_acquire_slot(void)
 {
-    switch (cmd) {
-        case CMD_MOVE_UP:    return MOVE_UP;
-        case CMD_MOVE_DOWN:  return MOVE_DOWN;
-        case CMD_MOVE_LEFT:  return MOVE_LEFT;
-        case CMD_MOVE_RIGHT: return MOVE_RIGHT;
-        default:             return MOVE_UP;
+    for (int i = 0; i < shm_n_slots; i++) {
+        if (sem_trywait(&shm_slots[i].sem_slot) == 0) {
+            if (!shm_slots[i].in_use) {
+                shm_slots[i].in_use = true;
+                return i;
+            }
+            sem_post(&shm_slots[i].sem_slot);
+        }
     }
+    for (int i = 0; i < shm_n_slots; i++) {
+        sem_wait(&shm_slots[i].sem_slot);
+        if (!shm_slots[i].in_use) {
+            shm_slots[i].in_use = true;
+            return i;
+        }
+        sem_post(&shm_slots[i].sem_slot);
+    }
+    return -1;
 }
 
-/* ============================================================
- * THREAD MOVE & SCORE
- *
- * Synchronisation : attend SIG_MOVE via sigwait().
- * Le thread principal ecrit pending_direction PUIS envoie SIG_MOVE.
- * Ce thread lit la direction, execute le mouvement, puis reveille Goal.
- * ============================================================ */
+static void shm_release_slot(int idx)
+{
+    shm_slots[idx].in_use  = false;
+    shm_slots[idx].game_id = -1;
+    sem_post(&shm_slots[idx].sem_slot);
+}
+
 void *move_score_thread(void *arg)
 {
     (void)arg;
+    sigset_t ws;
+    sigemptyset(&ws);
+    sigaddset(&ws, SIG_MOVE);
 
-    sigset_t wait_set;
-    sigemptyset(&wait_set);
-    sigaddset(&wait_set, SIG_MOVE);
-
-    while (game_running) {
+    while (server_running) {
         int sig;
-        if (sigwait(&wait_set, &sig) != 0) {
-            perror("sigwait move");
-            break;
+        if (sigwait(&ws, &sig) != 0) { perror("sigwait move"); break; }
+        if (!server_running) break;
+
+        int gid = current_game_id;
+
+        pthread_mutex_lock(&games_lock);
+        GameEntry *entry = NULL;
+        for (int i = 0; i < nb_games; i++) {
+            if (games[i].active && games[i].game_id == gid) {
+                entry = &games[i];
+                break;
+            }
+        }
+        if (!entry) {
+            pthread_mutex_unlock(&games_lock);
+            pthread_kill(goal_tid, SIG_GOAL);
+            continue;
         }
 
-        if (!game_running)
-            break;
+        MoveDirection dir = entry->pending_dir;
 
-        MoveDirection dir = pending_direction;
-        bool moved = game_move(&shared_game_state, dir);
+        int slot = shm_acquire_slot();
+        if (slot < 0) {
+            fprintf(stderr, "[Move&Score] Aucun slot SHM\n");
+            pthread_mutex_unlock(&games_lock);
+            pthread_kill(goal_tid, SIG_GOAL);
+            continue;
+        }
 
+        shm_slots[slot].game_id = gid;
+        memcpy(&shm_slots[slot].state, &entry->state, sizeof(GameState));
+
+        bool moved = game_move(&shm_slots[slot].state, dir);
         if (moved)
-            game_add_random_tile(&shared_game_state);
+            game_add_random_tile(&shm_slots[slot].state);
 
-        /* Reveiller Goal : le mouvement est termine, il peut verifier l'etat. */
+        memcpy(&entry->state, &shm_slots[slot].state, sizeof(GameState));
+        shm_release_slot(slot);
+
+        pthread_mutex_unlock(&games_lock);
         pthread_kill(goal_tid, SIG_GOAL);
     }
-
     return NULL;
 }
 
-/* ============================================================
- * THREAD GOAL
- *
- * Synchronisation : attend SIG_GOAL via sigwait().
- * Move&Score envoie SIG_GOAL une fois le mouvement effectue.
- * Ce thread verifie victoire/defaite et envoie l'etat au display.
- * ============================================================ */
 void *goal_thread(void *arg)
 {
     (void)arg;
+    sigset_t ws;
+    sigemptyset(&ws);
+    sigaddset(&ws, SIG_GOAL);
 
-    sigset_t wait_set;
-    sigemptyset(&wait_set);
-    sigaddset(&wait_set, SIG_GOAL);
-
-    while (game_running) {
+    while (server_running) {
         int sig;
-        if (sigwait(&wait_set, &sig) != 0) {
-            perror("sigwait goal");
-            break;
+        if (sigwait(&ws, &sig) != 0) { perror("sigwait goal"); break; }
+        if (!server_running) break;
+
+        int gid = current_game_id;
+
+        pthread_mutex_lock(&games_lock);
+        GameEntry *entry = NULL;
+        for (int i = 0; i < nb_games; i++) {
+            if (games[i].active && games[i].game_id == gid) {
+                entry = &games[i];
+                break;
+            }
+        }
+        if (!entry) { pthread_mutex_unlock(&games_lock); continue; }
+
+        if (entry->state.status == GAME_PLAYING) {
+            if (game_is_won(&entry->state))
+                entry->state.status = GAME_WON;
+            else if (game_is_lost(&entry->state))
+                entry->state.status = GAME_LOST;
         }
 
-        if (!game_running)
-            break;
+        DisplayMessage dmsg;
+        dmsg.game_id   = gid;
+        dmsg.game_over = (entry->state.status != GAME_PLAYING);
+        memcpy(&dmsg.state, &entry->state, sizeof(GameState));
 
-        /* Verification des conditions de fin de partie. */
-        if (shared_game_state.status == GAME_PLAYING) {
-            if (game_is_won(&shared_game_state))
-                shared_game_state.status = GAME_WON;
-            else if (game_is_lost(&shared_game_state))
-                shared_game_state.status = GAME_LOST;
-        }
+        int   dpipe_w = entry->display_pipe[1];
+        pid_t dpid    = entry->display_pid;
+        pthread_mutex_unlock(&games_lock);
 
-        /* Construction et envoi du message au display via pipe anonyme. */
-        DisplayMessage display_msg;
-        game_copy_state(&display_msg.state, &shared_game_state);
-        display_msg.game_over = (shared_game_state.status != GAME_PLAYING);
+        if (write(dpipe_w, &dmsg, sizeof(dmsg)) == -1)
+            perror("goal write display pipe");
+        if (dpid > 0)
+            kill(dpid, SIG_UPDATE_DISPLAY);
 
-        if (write(display_pipe[1], &display_msg, sizeof(DisplayMessage)) == -1)
-            perror("write display_pipe");
-
-        /* Reveil du processus display par signal inter-processus. */
-        if (display_pid > 0)
-            kill(display_pid, SIG_UPDATE_DISPLAY);
-
-        /* Fin de partie : arreter tous les processus. */
-        if (display_msg.game_over) {
-            game_running = 0;
-            if (display_pid > 0)
-                kill(display_pid, SIG_GAME_OVER);
-            break;
+        if (dmsg.game_over) {
+            if (dpid > 0) kill(dpid, SIG_GAME_OVER);
+            pthread_mutex_lock(&games_lock);
+            for (int i = 0; i < nb_games; i++) {
+                if (games[i].game_id == gid) {
+                    close(games[i].display_pipe[1]);
+                    waitpid(games[i].display_pid, NULL, 0);
+                    games[i].active = false;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&games_lock);
         }
     }
-
     return NULL;
 }
 
-/* ============================================================
- * HANDLER SIGINT / SIGTERM
- * ============================================================ */
-void cleanup_handler(int sig)
+void cleanup_handler(int s)
 {
-    (void)sig;
-    game_running = 0;
-    /* Debloquer les threads bloques dans sigwait(). */
+    (void)s;
+    server_running = 0;
     pthread_kill(move_tid, SIG_MOVE);
     pthread_kill(goal_tid, SIG_GOAL);
-    if (display_pid > 0)
-        kill(display_pid, SIGTERM);
 }
 
-/* ============================================================
- * MAIN
- * ============================================================ */
-int main()
+static int alloc_game_entry(int game_id)
 {
-    srand(time(NULL));
-
-    /*
-     * 1. Bloquer SIG_MOVE et SIG_GOAL dans le thread principal.
-     *
-     *    Ces signaux doivent etre traites UNIQUEMENT via sigwait()
-     *    dans les threads Move&Score et Goal. En les bloquant ici,
-     *    AVANT la creation des threads, tous les threads heritent
-     *    de ce masque, ce qui garantit que sigwait() est le seul
-     *    point de delivrance de ces signaux.
-     */
-    sigset_t thread_sigmask;
-    sigemptyset(&thread_sigmask);
-    sigaddset(&thread_sigmask, SIG_MOVE);
-    sigaddset(&thread_sigmask, SIG_GOAL);
-    if (pthread_sigmask(SIG_BLOCK, &thread_sigmask, NULL) != 0) {
-        perror("pthread_sigmask");
-        exit(EXIT_FAILURE);
-    }
-
-    /* 2. Pipe anonyme pour envoyer l'etat du jeu au processus display. */
-    if (pipe(display_pipe) == -1) {
-        perror("pipe display");
-        exit(EXIT_FAILURE);
-    }
-
-    /* 3. Fork du processus d'affichage. */
-    display_pid = fork();
-    if (display_pid == -1) {
-        perror("fork");
-        exit(EXIT_FAILURE);
-    }
-
-    if (display_pid == 0) {
-        /* Fils (display) : lit depuis stdin (redirige vers le pipe). */
-        close(display_pipe[1]);
-        if (dup2(display_pipe[0], STDIN_FILENO) == -1) {
-            perror("dup2");
-            exit(EXIT_FAILURE);
+    for (int i = 0; i < nb_games; i++) {
+        if (!games[i].active) {
+            games[i].active  = true;
+            games[i].game_id = game_id;
+            game_init(&games[i].state);
+            return i;
         }
-        close(display_pipe[0]);
-        execl("./bin/display", "display", NULL);
-        perror("execl display");
-        exit(EXIT_FAILURE);
+    }
+    if (nb_games >= MAX_GAMES) return -1;
+    GameEntry *tmp = realloc(games, (nb_games + 1) * sizeof(GameEntry));
+    if (!tmp) return -1;
+    games = tmp;
+    int idx = nb_games++;
+    memset(&games[idx], 0, sizeof(GameEntry));
+    games[idx].active  = true;
+    games[idx].game_id = game_id;
+    game_init(&games[idx].state);
+    return idx;
+}
+
+int main(int argc, char *argv[])
+{
+    srand((unsigned)time(NULL));
+
+    if (argc >= 2) {
+        shm_n_slots = atoi(argv[1]);
+        if (shm_n_slots < 1) shm_n_slots = 1;
+        if (shm_n_slots > MAX_GAMES) shm_n_slots = MAX_GAMES;
+    }
+    printf("[game2048] Demarrage avec %d slot(s) SHM.\n", shm_n_slots);
+
+    sigset_t tmask;
+    sigemptyset(&tmask);
+    sigaddset(&tmask, SIG_MOVE);
+    sigaddset(&tmask, SIG_GOAL);
+    pthread_sigmask(SIG_BLOCK, &tmask, NULL);
+
+    shm_unlink(SHM_NAME);
+    shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0600);
+    if (shm_fd == -1) { perror("shm_open"); exit(EXIT_FAILURE); }
+
+    size_t shm_size = (size_t)shm_n_slots * sizeof(SharedSlot);
+    if (ftruncate(shm_fd, (off_t)shm_size) == -1) { perror("ftruncate"); exit(EXIT_FAILURE); }
+
+    shm_slots = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_slots == MAP_FAILED) { perror("mmap"); exit(EXIT_FAILURE); }
+
+    for (int i = 0; i < shm_n_slots; i++) {
+        sem_init(&shm_slots[i].sem_slot, 1, 1);
+        shm_slots[i].in_use  = false;
+        shm_slots[i].game_id = -1;
     }
 
-    close(display_pipe[0]); /* parent : cote ecriture uniquement. */
-
-    /* 4. Initialisation de l'etat du jeu. */
-    game_init(&shared_game_state);
-
-    /* 5. Handlers pour arret propre (SIGINT / SIGTERM). */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = cleanup_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
     sigaction(SIGINT,  &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /*
-     * 6. Creation des threads.
-     *
-     *    Les threads heritent du masque de signaux => SIG_MOVE et SIG_GOAL
-     *    sont bloques en eux, prets a etre recus via sigwait().
-     */
-    if (pthread_create(&move_tid, NULL, move_score_thread, NULL) != 0) {
-        perror("pthread_create move_score");
-        exit(EXIT_FAILURE);
-    }
-    if (pthread_create(&goal_tid, NULL, goal_thread, NULL) != 0) {
-        perror("pthread_create goal");
-        exit(EXIT_FAILURE);
-    }
+    pthread_create(&move_tid, NULL, move_score_thread, NULL);
+    pthread_create(&goal_tid, NULL, goal_thread,       NULL);
 
-    /* 7. Pipe nomme (processus main -> processus 2048). */
-    if (mkfifo(NAMED_PIPE_MAIN_TO_2048, 0666) == -1 && errno != EEXIST) {
-        perror("mkfifo");
-        exit(EXIT_FAILURE);
-    }
-    int named_pipe_fd = open(NAMED_PIPE_MAIN_TO_2048, O_RDONLY);
-    if (named_pipe_fd == -1) {
-        perror("open named pipe");
-        exit(EXIT_FAILURE);
-    }
+    unlink(NAMED_PIPE_PATH);
+    if (mkfifo(NAMED_PIPE_PATH, 0666) == -1) { perror("mkfifo"); exit(EXIT_FAILURE); }
 
-    /* 8. Envoi de l'etat initial au display (grille de depart). */
-    {
-        DisplayMessage init_msg;
-        game_copy_state(&init_msg.state, &shared_game_state);
-        init_msg.game_over = false;
-        if (write(display_pipe[1], &init_msg, sizeof(DisplayMessage)) == -1)
-            perror("write initial display");
-        if (display_pid > 0)
-            kill(display_pid, SIG_UPDATE_DISPLAY);
-    }
+    int named_fd = open(NAMED_PIPE_PATH, O_RDWR);
+    if (named_fd == -1) { perror("open named pipe"); exit(EXIT_FAILURE); }
 
-    /*
-     * 9. Boucle principale : lecture des commandes depuis le pipe nomme.
-     *
-     *    - Mouvement : stocker la direction dans pending_direction,
-     *      puis envoyer SIG_MOVE a Move&Score via pthread_kill().
-     *    - CMD_QUIT  : arreter tout proprement.
-     */
-    CommandMessage cmd_msg;
+    printf("[game2048] Pret. En attente de connexions...\n");
 
-    while (game_running) {
-        ssize_t n = read(named_pipe_fd, &cmd_msg, sizeof(CommandMessage));
+    int next_id = 0;
+    CommandMessage msg;
 
-        if (n == 0)
-            break; /* Pipe nomme ferme (processus main termine). */
-
+    while (server_running) {
+        ssize_t n = read(named_fd, &msg, sizeof(msg));
+        if (n == 0) {
+            struct timespec ts = {0, 1000000};
+            nanosleep(&ts, NULL);
+            continue;
+        }
         if (n == -1) {
-            if (errno == EINTR)
-                continue;
+            if (errno == EINTR) continue;
             perror("read named pipe");
             break;
         }
+        if (n != (ssize_t)sizeof(msg)) continue;
 
-        if (n != sizeof(CommandMessage))
+        if (msg.command == CMD_NEW_GAME) {
+            int new_id = next_id++;
+            pthread_mutex_lock(&games_lock);
+            int idx = alloc_game_entry(new_id);
+            pthread_mutex_unlock(&games_lock);
+
+            if (idx < 0) { fprintf(stderr, "Trop de parties.\n"); continue; }
+
+            if (pipe(games[idx].display_pipe) == -1) { perror("pipe display"); continue; }
+
+            pid_t dpid = fork();
+            if (dpid == 0) {
+                close(games[idx].display_pipe[1]);
+                dup2(games[idx].display_pipe[0], STDIN_FILENO);
+                close(games[idx].display_pipe[0]);
+                execl("./bin/display", "display", NULL);
+                perror("execl display");
+                exit(EXIT_FAILURE);
+            }
+            close(games[idx].display_pipe[0]);
+            games[idx].display_pid = dpid;
+
+            DisplayMessage init_msg;
+            init_msg.game_id   = new_id;
+            init_msg.game_over = false;
+            memcpy(&init_msg.state, &games[idx].state, sizeof(GameState));
+            write(games[idx].display_pipe[1], &init_msg, sizeof(init_msg));
+            kill(dpid, SIG_UPDATE_DISPLAY);
+
+            char reg_path[64];
+            snprintf(reg_path, sizeof(reg_path), "%s%d", REG_PIPE_PREFIX, msg.game_id);
+            int reg_fd = open(reg_path, O_WRONLY);
+            if (reg_fd != -1) {
+                RegistrationReply reply = { .game_id = new_id };
+                write(reg_fd, &reply, sizeof(reply));
+                close(reg_fd);
+            }
+            printf("[game2048] Partie %d creee (display PID=%d).\n", new_id, dpid);
             continue;
-
-        if (cmd_msg.command == CMD_QUIT) {
-            game_running = 0;
-            pthread_kill(move_tid, SIG_MOVE);
-            pthread_kill(goal_tid, SIG_GOAL);
-            if (display_pid > 0)
-                kill(display_pid, SIGTERM);
-            break;
         }
 
-        /* Transmettre la direction et reveiller Move&Score par signal. */
-        pending_direction = command_to_direction(cmd_msg.command);
-        pthread_kill(move_tid, SIG_MOVE);
+        if (msg.command == CMD_QUIT) {
+            pthread_mutex_lock(&games_lock);
+            for (int i = 0; i < nb_games; i++) {
+                if (games[i].active && games[i].game_id == msg.game_id) {
+                    kill(games[i].display_pid, SIGTERM);
+                    close(games[i].display_pipe[1]);
+                    waitpid(games[i].display_pid, NULL, 0);
+                    games[i].active = false;
+                    printf("[game2048] Partie %d abandonnee.\n", msg.game_id);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&games_lock);
+            continue;
+        }
+
+        pthread_mutex_lock(&games_lock);
+        for (int i = 0; i < nb_games; i++) {
+            if (games[i].active && games[i].game_id == msg.game_id) {
+                games[i].pending_dir = (MoveDirection)msg.command;
+                current_game_id      = msg.game_id;
+                pthread_mutex_unlock(&games_lock);
+                pthread_kill(move_tid, SIG_MOVE);
+                goto next_msg;
+            }
+        }
+        pthread_mutex_unlock(&games_lock);
+next_msg:;
     }
 
-    /* 10. Nettoyage. */
-    close(named_pipe_fd);
-    unlink(NAMED_PIPE_MAIN_TO_2048);
-
+    close(named_fd);
+    unlink(NAMED_PIPE_PATH);
+    pthread_kill(move_tid, SIG_MOVE);
+    pthread_kill(goal_tid, SIG_GOAL);
     pthread_join(move_tid, NULL);
     pthread_join(goal_tid, NULL);
 
-    close(display_pipe[1]); /* EOF pour le display. */
-    if (display_pid > 0)
-        waitpid(display_pid, NULL, 0);
+    pthread_mutex_lock(&games_lock);
+    for (int i = 0; i < nb_games; i++) {
+        if (games[i].active) {
+            kill(games[i].display_pid, SIGTERM);
+            close(games[i].display_pipe[1]);
+            waitpid(games[i].display_pid, NULL, WNOHANG);
+        }
+    }
+    pthread_mutex_unlock(&games_lock);
+    free(games);
+
+    for (int i = 0; i < shm_n_slots; i++)
+        sem_destroy(&shm_slots[i].sem_slot);
+    munmap(shm_slots, shm_size);
+    close(shm_fd);
+    shm_unlink(SHM_NAME);
 
     return 0;
 }

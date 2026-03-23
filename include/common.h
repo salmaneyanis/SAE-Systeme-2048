@@ -10,28 +10,23 @@
 
 #include <stdbool.h>
 
-// ============================================
-// PIPES
-// ============================================
+/* Pipe nomme unique partage par TOUS les processus main */
+#define NAMED_PIPE_PATH     "/tmp/2048_pipe"
 
-// Nom du pipe nommé (FIFO) pour la communication entre le processus main et game2048
-// Le processus main écrit dans ce pipe, game2048 lit depuis ce pipe
-#define NAMED_PIPE_MAIN_TO_2048 "/tmp/2048_main_pipe"
+/* Prefixe des pipes de retour pour l'enregistrement.
+ * Chaque main cree /tmp/2048_reg_<son_pid> pour recevoir son game_id */
+#define REG_PIPE_PREFIX     "/tmp/2048_reg_"
 
-// Taille du pipe anonyme (utilisé pour dimensionner les buffers si nécessaire)
-#define ANONYMOUS_PIPE_SIZE 4096
+/* Signaux inter-threads (a l'interieur de game2048) */
+#define SIG_MOVE  SIGUSR1   /* thread principal -> Move&Score */
+#define SIG_GOAL  SIGUSR2   /* Move&Score -> Goal             */
 
-// ============================================
-// SIGNaux
-// ============================================
+/* Signaux inter-processus (game2048 -> display) */
+#define SIG_UPDATE_DISPLAY  SIGUSR1
+#define SIG_GAME_OVER       SIGUSR2
 
-// Signal personnalisé pour réveiller le processus d'affichage
-// Envoyé par game2048 au processus display lorsqu'une mise à jour est disponible
-#define SIG_UPDATE_DISPLAY SIGUSR1
-
-// Signal personnalisé pour indiquer la fin de partie
-// Envoyé par game2048 au processus display lorsque la partie est terminée
-#define SIG_GAME_OVER SIGUSR2
+/* Nom du segment de memoire partagee (etapes 2 et 3) */
+#define SHM_NAME            "/shm_2048"
 
 #endif // COMMON_H
 

@@ -1,11 +1,16 @@
 /*
  * main_process.c
- * 
- * Ce fichier implémente le processus de saisie des commandes utilisateur.
- * Il lit les commandes au clavier et les envoie au processus principal du jeu
- * via un pipe nommé (FIFO).
+ *
+ * Usage : ./bin/main
+ *
+ * Ce processus :
+ * 1. Cree un pipe de retour /tmp/2048_reg_<pid> pour recevoir son game_id
+ * 2. Envoie CMD_NEW_GAME a game2048 via le pipe nomme unique
+ * 3. Attend la reponse (son game_id)
+ * 4. Lit les commandes clavier et les envoie avec son game_id
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,123 +21,101 @@
 #include "common.h"
 #include "ipc.h"
 
-/**
- * Fonction principale du processus de saisie
- * 
- * Ce processus :
- * 1. Crée ou utilise un pipe nommé pour communiquer avec game2048
- * 2. Lit les commandes utilisateur au clavier
- * 3. Convertit les commandes en messages structurés
- * 4. Envoie les messages au processus game2048
- */
-int main() {
-    // ============================================
-    // ÉTAPE 1 : Création du pipe nommé (FIFO)
-    // ============================================
-    // Le pipe nommé permet la communication entre processus indépendants.
-    // mkfifo() crée un fichier spécial qui agit comme un tube.
-    // Les permissions 0666 permettent la lecture et l'écriture pour tous.
-    if (mkfifo(NAMED_PIPE_MAIN_TO_2048, 0666) == -1) {
-        // Si le pipe existe déjà (EEXIST), c'est normal (redémarrage du jeu).
-        // Sinon, c'est une vraie erreur qu'on doit gérer.
-        if (errno != EEXIST) {
-            perror("mkfifo");
-            exit(EXIT_FAILURE);
-        }
-    }
-    
-    // ============================================
-    // ÉTAPE 2 : Ouverture du pipe en écriture
-    // ============================================
-    // O_WRONLY : mode écriture uniquement.
-    // Cette opération bloque jusqu'à ce qu'un processus ouvre le pipe en lecture.
-    int pipe_fd = open(NAMED_PIPE_MAIN_TO_2048, O_WRONLY);
+int main(void)
+{
+    /* --- Ouverture du pipe nomme en ecriture --- */
+    int pipe_fd = open(NAMED_PIPE_PATH, O_WRONLY);
     if (pipe_fd == -1) {
-        perror("open pipe");
+        perror("open named pipe");
+        fprintf(stderr, "Lancez d'abord game2048.\n");
         exit(EXIT_FAILURE);
     }
-    
-    // ============================================
-    // ÉTAPE 3 : Affichage des instructions
-    // ============================================
-    printf("=== Jeu 2048 ===\n");
-    printf("Commandes: w (haut), s (bas), a (gauche), d (droite), q (quitter)\n");
-    
-    // Variables pour la boucle principale
-    char command;              // Commande lue au clavier
-    CommandMessage msg;        // Message structuré à envoyer
-    
-    // ============================================
-    // ÉTAPE 4 : Boucle principale de saisie
-    // ============================================
+
+    /*
+     * --- Enregistrement ---
+     * On cree un pipe de retour avec notre PID dans le nom.
+     * game2048 lira ce nom depuis le message et nous repondra dedans.
+     */
+    pid_t my_pid = getpid();
+    char reg_path[64];
+    snprintf(reg_path, sizeof(reg_path), "%s%d", REG_PIPE_PREFIX, (int)my_pid);
+
+    if (mkfifo(reg_path, 0600) == -1 && errno != EEXIST) {
+        perror("mkfifo reg pipe");
+        close(pipe_fd);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Envoyer la demande : game_id = notre PID comme cookie */
+    CommandMessage req;
+    req.game_id = (int)my_pid;
+    req.command = CMD_NEW_GAME;
+    if (write(pipe_fd, &req, sizeof(req)) == -1) {
+        perror("write new_game");
+        close(pipe_fd);
+        unlink(reg_path);
+        exit(EXIT_FAILURE);
+    }
+
+    /* Attendre la reponse de game2048 (bloquant) */
+    int reg_fd = open(reg_path, O_RDONLY);
+    if (reg_fd == -1) {
+        perror("open reg pipe");
+        close(pipe_fd);
+        unlink(reg_path);
+        exit(EXIT_FAILURE);
+    }
+
+    RegistrationReply reply;
+    if (read(reg_fd, &reply, sizeof(reply)) != sizeof(reply)) {
+        fprintf(stderr, "Reponse d'enregistrement invalide\n");
+        close(reg_fd);
+        close(pipe_fd);
+        unlink(reg_path);
+        exit(EXIT_FAILURE);
+    }
+    close(reg_fd);
+    unlink(reg_path);
+
+    int game_id = reply.game_id;
+    printf("[main] Partie %d demarree !\n", game_id);
+    printf("Commandes : w(haut) s(bas) a(gauche) d(droite) q(quitter)\n");
+
+    /* --- Boucle de saisie --- */
+    char input;
+    CommandMessage msg;
+    msg.game_id = game_id;
+
     while (1) {
-        // Afficher le prompt et forcer l'affichage immédiat
-        printf("> ");
+        printf("[partie %d] > ", game_id);
         fflush(stdout);
-        
-        // Lire une commande au clavier
-        // Le format " %c" ignore les espaces et lit un caractère.
-        if (scanf(" %c", &command) != 1) {
-            // Si on atteint la fin du fichier (EOF), sortir de la boucle
-            if (feof(stdin)) {
-                break;
-            }
-            // Sinon, ignorer l'entrée invalide et continuer
+
+        if (scanf(" %c", &input) != 1) {
+            if (feof(stdin)) break;
             continue;
         }
-        
-        // ============================================
-        // ÉTAPE 5 : Conversion de la commande
-        // ============================================
-        // Convertir le caractère saisi en CommandType pour le message.
-        switch (command) {
-            case 'w':
-            case 'W':
-                msg.command = CMD_MOVE_UP;      // Mouvement vers le haut
-                break;
-            case 's':
-            case 'S':
-                msg.command = CMD_MOVE_DOWN;    // Mouvement vers le bas
-                break;
-            case 'a':
-            case 'A':
-                msg.command = CMD_MOVE_LEFT;    // Mouvement vers la gauche
-                break;
-            case 'd':
-            case 'D':
-                msg.command = CMD_MOVE_RIGHT;   // Mouvement vers la droite
-                break;
-            case 'q':
-            case 'Q':
-                // Commande spéciale : quitter le jeu
+
+        switch (input) {
+            case 'w': case 'W': msg.command = CMD_MOVE_UP;    break;
+            case 's': case 'S': msg.command = CMD_MOVE_DOWN;  break;
+            case 'a': case 'A': msg.command = CMD_MOVE_LEFT;  break;
+            case 'd': case 'D': msg.command = CMD_MOVE_RIGHT; break;
+            case 'q': case 'Q':
                 msg.command = CMD_QUIT;
-                // Envoyer immédiatement la commande de sortie
-                if (write(pipe_fd, &msg, sizeof(CommandMessage)) == -1) {
-                    perror("write quit");
-                }
-                // Fermer le pipe et terminer proprement
+                write(pipe_fd, &msg, sizeof(msg));
                 close(pipe_fd);
                 exit(EXIT_SUCCESS);
             default:
-                // Commande invalide : afficher un message d'aide
-                printf("Commande invalide. Utilisez w/s/a/d pour jouer, q pour quitter.\n");
-                continue;  // Ignorer cette commande et continuer la boucle
+                printf("Commande invalide.\n");
+                continue;
         }
-        
-        // ============================================
-        // ÉTAPE 6 : Envoi de la commande
-        // ============================================
-        // Envoyer le message structuré au processus game2048 via le pipe.
-        // write() est bloquant : il attend que le récepteur lise les données.
-        if (write(pipe_fd, &msg, sizeof(CommandMessage)) == -1) {
+
+        if (write(pipe_fd, &msg, sizeof(msg)) == -1) {
             perror("write command");
-            break;  // En cas d'erreur, sortir de la boucle
+            break;
         }
     }
-    
-    // ============================================
-    // NETTOYAGE : Fermeture du pipe
-    // ============================================
+
     close(pipe_fd);
     return 0;
 }

@@ -18,12 +18,15 @@
  * Types de commandes envoyées depuis le processus main vers game2048
  */
 typedef enum {
-    CMD_MOVE_UP,      // Commande de mouvement vers le haut
-    CMD_MOVE_DOWN,    // Commande de mouvement vers le bas
-    CMD_MOVE_LEFT,    // Commande de mouvement vers la gauche
-    CMD_MOVE_RIGHT,   // Commande de mouvement vers la droite
-    CMD_QUIT          // Commande pour quitter le jeu
+    CMD_MOVE_UP,
+    CMD_MOVE_DOWN,
+    CMD_MOVE_LEFT,
+    CMD_MOVE_RIGHT,
+    CMD_QUIT,
+    CMD_NEW_GAME
 } CommandType;
+
+#define MAX_GAMES 8
 
 // ============================================
 // STRUCTURES DE MESSAGES
@@ -36,8 +39,11 @@ typedef enum {
  * Le processus main écrit ce message, game2048 le lit.
  */
 typedef struct {
+    int         game_id;  //identifiant de la partie, -1 si pas encore attribue 
     CommandType command;  // Type de commande à exécuter
 } CommandMessage;
+
+//Ajout de game_id pour que la commande soit envoyé à la bonne partie car toutes les commandes sont envoyé dans le même pipes depuis le main
 
 /**
  * Message envoyé depuis game2048 vers le processus display
@@ -46,9 +52,16 @@ typedef struct {
  * game2048 écrit ce message, le processus display le lit depuis stdin (redirigé).
  */
 typedef struct {
+    int       game_id;
     GameState state;     // État complet du jeu (grille, score, statut)
     bool game_over;      // Indicateur si la partie est terminée
 } DisplayMessage;
+
+// reponse envoye par game2048 au main lors de l'enregistrement
+
+typedef struct {
+    int game_id;
+} RegistrationReply;
 
 #endif // IPC_H
 

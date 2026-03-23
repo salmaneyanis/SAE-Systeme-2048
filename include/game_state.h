@@ -9,6 +9,7 @@
 #define GAME_STATE_H
 
 #include <stdbool.h>
+#include <semaphore.h>
 
 // ============================================
 // CONSTANTES
@@ -68,6 +69,26 @@ typedef struct {
     bool quit;        // Indicateur de sortie
     bool new_move;    // Indicateur de nouveau mouvement
 } GameMessage;
+
+
+/*
+ * Slot de memoire partagee pour une partie.
+ *
+ * Etape 2 : le segment contient 1 slot
+ * Etape 3 : le segment contient N slots
+ *
+ * sem_slot  : semaphore qui protege l'acces au slot (section critique).
+ *             Valeur initiale = 1 (binaire), donc un seul thread a la fois.
+ * in_use    : true si un thread Move&Score travaille dessus en ce moment.
+ * game_id   : quelle partie utilise ce slot.
+ * state     : les donnees du jeu copiees depuis le heap vers la SHM.
+ */
+typedef struct {
+    sem_t     sem_slot;
+    bool      in_use;
+    int       game_id;
+    GameState state;
+} SharedSlot;
 
 #endif // GAME_STATE_H
 

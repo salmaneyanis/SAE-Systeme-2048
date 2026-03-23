@@ -53,7 +53,7 @@ $(BINDIR)/main: $(MAIN_PROCESS_OBJ) | $(BINDIR)
 	$(CC) $(CFLAGS) $< -o $@
 
 $(BINDIR)/game2048: $(GAME_2048_OBJ) $(GAME_LOGIC_OBJ) | $(BINDIR)
-	$(CC) $(CFLAGS) $^ -o $@ -pthread
+	$(CC) $(CFLAGS) $^ -o $@ -pthread -lrt
 
 $(BINDIR)/display: $(DISPLAY_PROCESS_OBJ) $(DISPLAY_GRID_OBJ) | $(BINDIR)
 	$(CC) $(CFLAGS) $^ -o $@

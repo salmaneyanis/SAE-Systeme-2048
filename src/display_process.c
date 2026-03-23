@@ -117,8 +117,7 @@ int main()
             continue;
 
         printf("\033[2J\033[H");
-        printf("=== 2048 ===\n");
-        printf("Score: %d\n\n", msg.state.score);
+        printf("=== Partie %d === Score : %d\n\n", msg.game_id, msg.state.score);
 
         update_grid(msg.state.grid);
         print_grid(get_formatted_grid());
